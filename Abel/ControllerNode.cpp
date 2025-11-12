@@ -100,7 +100,6 @@ private:
         }
     }
 
-    // internal variables
     int motorLeftID;
     int motorRightID;
     int stickID;
