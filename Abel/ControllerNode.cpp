@@ -1,121 +1,134 @@
-#include <chrono>
-#include <functional>
-#include <memory>
-#include <string>
-#include <algorithm>
-#include <cmath>
-
+#include "SparkMax.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/joy.hpp"
 #include "std_msgs/msg/string.hpp"
+#include <cmath>
+#include <string>
+#include <algorithm>
 
-#include </home/developer/suave-ros/suave-ros/src/controller/src/suave_ros_sparkmax.h>
+const float VELOCITY_MAX = 2500.0;  // Max RPM
 
-using std::placeholders::_1;
-using namespace std::chrono_literals;
-
-const float VELOCITY_MAX = 2500.0; 
 enum CAN_IDs
 {
-  LEFT_MOTOR = 1,
-  RIGHT_MOTOR = 2
+    LEFT_MOTOR = 1,
+    RIGHT_MOTOR = 2
 };
+
+namespace Gp
+{
+    enum Axes
+    {
+        _LEFT_HORIZONTAL_STICK = 0,
+        _LEFT_VERTICAL_STICK = 1
+    };
+
+    enum Buttons
+    {
+        _LEFT_TRIGGER = 6,
+        _RIGHT_TRIGGER = 7
+    };
+}
 
 class ControllerNode : public rclcpp::Node
 {
 public:
-    ControllerNode() : Node("controller_node")
+    ControllerNode(const std::string &can_interface)
+        : Node("controller_node"),
+          leftMotor(can_interface, LEFT_MOTOR),
+          rightMotor(can_interface, RIGHT_MOTOR)
     {
-        // init motors with CAN IDs
-        leftMotor = suave::CEREVOSparkMax(LEFT_MOTOR);
-        rightMotor = suave::CEREVOSparkMax(RIGHT_MOTOR);
+        RCLCPP_INFO(this->get_logger(), "Initializing Motors...");
+
+        leftMotor.SetIdleMode(IdleMode::kBrake);
+        rightMotor.SetIdleMode(IdleMode::kBrake);
+
+        leftMotor.SetMotorType(MotorType::kBrushless);
+        rightMotor.SetMotorType(MotorType::kBrushless);
 
         leftMotor.SetInverted(false);
         rightMotor.SetInverted(true);
-        try {
-            leftMotor.BurnFlash();
-            rightMotor.BurnFlash();
-        } catch (const std::exception &ex) {
-            RCLCPP_WARN(this->get_logger(), "BurnFlash not supported: %s", ex.what());
-        }
+
+        leftMotor.BurnFlash();
+        rightMotor.BurnFlash();
+
+        RCLCPP_INFO(this->get_logger(), "Motors Initialized");
+
         joy_subscriber_ = this->create_subscription<sensor_msgs::msg::Joy>(
-            "/joy",
-            10,
-            std::bind(&ControllerNode::joy_callback, this, _1)
-        );
+            "/joy", 10,
+            std::bind(&ControllerNode::joy_callback, this, std::placeholders::_1));
+
         heartbeatPub = this->create_publisher<std_msgs::msg::String>("/heartbeat", 10);
         timer = this->create_wall_timer(
             std::chrono::milliseconds(1000),
-            std::bind(&ControllerNode::publish_heartbeat, this)
-        );
-
-        RCLCPP_INFO(this->get_logger(), "Controller node initialized with heartbeat and BurnFlash");
+            std::bind(&ControllerNode::publish_heartbeat, this));
     }
 
 private:
+    SparkMax leftMotor;
+    SparkMax rightMotor;
+
+    rclcpp::Subscription<sensor_msgs::msg::Joy>::SharedPtr joy_subscriber_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr heartbeatPub;
+    rclcpp::TimerBase::SharedPtr timer;
+
+    float computeStepOutput(float value)
+    {
+        float absVal = std::fabs(value);
+        if (absVal < 0.25f) return 0.0f;
+        else if (absVal < 0.5f) return (value > 0 ? 0.25f : -0.25f);
+        else if (absVal < 0.75f) return (value > 0 ? 0.5f : -0.5f);
+        else if (absVal < 1.0f) return (value > 0 ? 0.75f : -0.75f);
+        return (value > 0 ? 1.0f : -1.0f);
+    }
+
+    void joy_callback(const sensor_msgs::msg::Joy::SharedPtr joy_msg)
+    {
+        if (joy_msg->axes.size() < 2) return;
+
+        // send CAN heartbeat
+        try {
+            leftMotor.Heartbeat();
+            rightMotor.Heartbeat();
+        } catch (const std::exception &ex) {
+            RCLCPP_ERROR(this->get_logger(), "Heartbeat error: %s", ex.what());
+        }
+
+        // safety triggers
+        bool triggersPressed = joy_msg->buttons.size() > 7 &&
+                               (joy_msg->buttons[Gp::Buttons::_LEFT_TRIGGER] > 0 ||
+                                joy_msg->buttons[Gp::Buttons::_RIGHT_TRIGGER] > 0);
+        if (!triggersPressed)
+        {
+            leftMotor.SetDutyCycle(0.0f);
+            rightMotor.SetDutyCycle(0.0f);
+            return;
+        }
+
+        float forward = -joy_msg->axes[Gp::Axes::_LEFT_VERTICAL_STICK];
+        float turn = joy_msg->axes[Gp::Axes::_LEFT_HORIZONTAL_STICK];
+
+        float left = std::clamp(forward + turn, -1.0f, 1.0f);
+        float right = std::clamp(forward - turn, -1.0f, 1.0f);
+
+        leftMotor.SetVelocity(computeStepOutput(left) * VELOCITY_MAX);
+        rightMotor.SetVelocity(computeStepOutput(right) * VELOCITY_MAX);
+    }
+
     void publish_heartbeat()
     {
         auto msg = std_msgs::msg::String();
         msg.data = "Heartbeat";
         heartbeatPub->publish(msg);
+        RCLCPP_INFO(this->get_logger(), "Heartbeat published");
     }
-    void joy_callback(const sensor_msgs::msg::Joy::SharedPtr msg)
-    {
-        if (msg->axes.size() < 4 || msg->buttons.empty())
-        {
-            RCLCPP_WARN(this->get_logger(), "Invalid joystick message received");
-            return;
-        }
-        try {
-            leftMotor.Heartbeat();
-            rightMotor.Heartbeat();
-        }
-        catch (const std::exception &ex)
-        {
-            RCLCPP_ERROR(this->get_logger(), "Heartbeat error: %s", ex.what());
-        }
-
-        if (msg->buttons[5] == 0 && msg->buttons[7] == 0)
-        {
-            leftMotor.Cease();
-            rightMotor.Cease();
-            RCLCPP_INFO(this->get_logger(), "Motor safety active");
-            return;
-        }
-
-        double forward = msg->axes[1];
-        double rotation = msg->axes[3];
-
-        double leftPower = forward + rotation;
-        double rightPower = forward - rotation;
-
-        leftPower = std::clamp(leftPower, -1.0, 1.0);
-        rightPower = std::clamp(rightPower, -1.0, 1.0);
-
-        RCLCPP_INFO(this->get_logger(), "L: %.2f  R: %.2f", leftPower, rightPower);
-
-        try
-        {
-            leftMotor.Move(leftPower);
-            rightMotor.Move(rightPower);
-        }
-        catch (const std::exception &ex)
-        {
-            RCLCPP_ERROR(this->get_logger(), "Failed to send CAN commands: %s", ex.what());
-        }
-    }
-    suave::CEREVOSparkMax leftMotor;
-    suave::CEREVOSparkMax rightMotor;
-
-    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr heartbeatPub;
-    rclcpp::TimerBase::SharedPtr timer;
-    rclcpp::Subscription<sensor_msgs::msg::Joy>::SharedPtr joy_subscriber_;
 };
 
-int main(int argc, char *argv[])
+int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<ControllerNode>());
+    std::string can_interface = "can0";
+    auto node = std::make_shared<ControllerNode>(can_interface);
+    rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;
 }
