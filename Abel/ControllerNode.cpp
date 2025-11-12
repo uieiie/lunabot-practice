@@ -3,6 +3,7 @@
 #include <memory>
 #include <string>
 #include <algorithm>
+#include <cmath>
 
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/joy.hpp"
@@ -13,37 +14,42 @@
 using std::placeholders::_1;
 using namespace std::chrono_literals;
 
+const float VELOCITY_MAX = 2500.0; 
+enum CAN_IDs
+{
+  LEFT_MOTOR = 1,
+  RIGHT_MOTOR = 2
+};
+
 class ControllerNode : public rclcpp::Node
 {
 public:
     ControllerNode() : Node("controller_node")
     {
-        motorLeftID = this->declare_parameter<int>("motor_left_id", 1);
-        motorRightID = this->declare_parameter<int>("motor_right_id", 2);
-
-        stickID = this->declare_parameter<int>("stick_id", 1);
-        tickRateMS = this->declare_parameter<int>("tick_rate_ms", 500);
-
-        leftMotor = suave::CEREVOSparkMax(motorLeftID);
-        rightMotor = suave::CEREVOSparkMax(motorRightID);
+        // init motors with CAN IDs
+        leftMotor = suave::CEREVOSparkMax(LEFT_MOTOR);
+        rightMotor = suave::CEREVOSparkMax(RIGHT_MOTOR);
 
         leftMotor.SetInverted(false);
-        rightMotor.SetInverted(false);
-
+        rightMotor.SetInverted(true);
+        try {
+            leftMotor.BurnFlash();
+            rightMotor.BurnFlash();
+        } catch (const std::exception &ex) {
+            RCLCPP_WARN(this->get_logger(), "BurnFlash not supported: %s", ex.what());
+        }
         joy_subscriber_ = this->create_subscription<sensor_msgs::msg::Joy>(
             "/joy",
             10,
             std::bind(&ControllerNode::joy_callback, this, _1)
         );
-
         heartbeatPub = this->create_publisher<std_msgs::msg::String>("/heartbeat", 10);
-
         timer = this->create_wall_timer(
-            std::chrono::milliseconds(tickRateMS),
+            std::chrono::milliseconds(1000),
             std::bind(&ControllerNode::publish_heartbeat, this)
         );
 
-        RCLCPP_INFO(this->get_logger(), "Controller node with heartbeats initialized");
+        RCLCPP_INFO(this->get_logger(), "Controller node initialized with heartbeat and BurnFlash");
     }
 
 private:
@@ -60,7 +66,6 @@ private:
             RCLCPP_WARN(this->get_logger(), "Invalid joystick message received");
             return;
         }
-
         try {
             leftMotor.Heartbeat();
             rightMotor.Heartbeat();
@@ -74,7 +79,7 @@ private:
         {
             leftMotor.Cease();
             rightMotor.Cease();
-            RCLCPP_INFO(this->get_logger(), "Motor safety deactivated");
+            RCLCPP_INFO(this->get_logger(), "Motor safety active");
             return;
         }
 
@@ -99,12 +104,6 @@ private:
             RCLCPP_ERROR(this->get_logger(), "Failed to send CAN commands: %s", ex.what());
         }
     }
-
-    int motorLeftID;
-    int motorRightID;
-    int stickID;
-    int tickRateMS;
-
     suave::CEREVOSparkMax leftMotor;
     suave::CEREVOSparkMax rightMotor;
 
@@ -120,4 +119,3 @@ int main(int argc, char *argv[])
     rclcpp::shutdown();
     return 0;
 }
-
