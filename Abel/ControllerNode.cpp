@@ -1,12 +1,11 @@
 #include "SparkMax.hpp"
-#include "rclcpp/rclcpp.hpp"
-#include "sensor_msgs/msg/joy.hpp"
-#include "std_msgs/msg/string.hpp"
+#include <rclcpp/rclcpp.hpp>
+#include <general_msgs/msg/joy.hpp>
+#include <controller_pkg/srv/excavation_request.hpp>
 #include <cmath>
 #include <string>
-#include <algorithm>
 
-const float VELOCITY_MAX = 2500.0;  // Max RPM
+const float VELOCITY_MAX = 2500.0f;
 
 enum CAN_IDs
 {
@@ -16,16 +15,30 @@ enum CAN_IDs
 
 namespace Gp
 {
+    enum Buttons
+    {
+        _A = 0,
+        _B = 1,
+        _X = 2,
+        _Y = 3,
+        _LEFT_BUMPER = 4,
+        _RIGHT_BUMPER = 5,
+        _LEFT_TRIGGER = 6,
+        _RIGHT_TRIGGER = 7,
+        _WINDOW_KEY = 8,
+        _D_PAD_UP = 12,
+        _D_PAD_DOWN = 13,
+        _D_PAD_LEFT = 14,
+        _D_PAD_RIGHT = 15,
+        _X_BOX_KEY = 16
+    };
+
     enum Axes
     {
         _LEFT_HORIZONTAL_STICK = 0,
-        _LEFT_VERTICAL_STICK = 1
-    };
-
-    enum Buttons
-    {
-        _LEFT_TRIGGER = 6,
-        _RIGHT_TRIGGER = 7
+        _LEFT_VERTICAL_STICK = 1,
+        _RIGHT_HORIZONTAL_STICK = 2,
+        _RIGHT_VERTICAL_STICK = 3
     };
 }
 
@@ -37,97 +50,115 @@ public:
           leftMotor(can_interface, LEFT_MOTOR),
           rightMotor(can_interface, RIGHT_MOTOR)
     {
-        RCLCPP_INFO(this->get_logger(), "Initializing Motors...");
+        RCLCPP_INFO(this->get_logger(), "Starting controller node...");
+        RCLCPP_INFO(this->get_logger(), "Setting up motors...");
 
         leftMotor.SetIdleMode(IdleMode::kBrake);
         rightMotor.SetIdleMode(IdleMode::kBrake);
-
         leftMotor.SetMotorType(MotorType::kBrushless);
         rightMotor.SetMotorType(MotorType::kBrushless);
 
-        leftMotor.SetInverted(false);
-        rightMotor.SetInverted(true);
+        excavation_client_ = this->create_client<controller_pkg::srv::ExcavationRequest>(
+            "excavation_service");
 
-        leftMotor.BurnFlash();
-        rightMotor.BurnFlash();
-
-        RCLCPP_INFO(this->get_logger(), "Motors Initialized");
-
-        joy_subscriber_ = this->create_subscription<sensor_msgs::msg::Joy>(
-            "/joy", 10,
+        joy_subscriber_ = this->create_subscription<general_msgs::msg::Joy>(
+            "/joy",
+            10,
             std::bind(&ControllerNode::joy_callback, this, std::placeholders::_1));
 
-        heartbeatPub = this->create_publisher<std_msgs::msg::String>("/heartbeat", 10);
-        timer = this->create_wall_timer(
-            std::chrono::milliseconds(1000),
-            std::bind(&ControllerNode::publish_heartbeat, this));
+        timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(100),
+            std::bind(&ControllerNode::heartbeat_timer, this));
     }
 
 private:
-    SparkMax leftMotor;
-    SparkMax rightMotor;
-
-    rclcpp::Subscription<sensor_msgs::msg::Joy>::SharedPtr joy_subscriber_;
-    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr heartbeatPub;
-    rclcpp::TimerBase::SharedPtr timer;
-
-    float computeStepOutput(float value)
+    // step function for joystick
+    float joystickToDutyCycle(float value)
     {
-        float absVal = std::fabs(value);
-        if (absVal < 0.25f) return 0.0f;
-        else if (absVal < 0.5f) return (value > 0 ? 0.25f : -0.25f);
-        else if (absVal < 0.75f) return (value > 0 ? 0.5f : -0.5f);
-        else if (absVal < 1.0f) return (value > 0 ? 0.75f : -0.75f);
+        if (value > 1.0f)
+            value = 1.0f;
+        if (value < -1.0f)
+            value = -1.0f;
+
+        float a = std::fabs(value);
+
+        if (a < 0.25f)
+            return 0.0f;
+        else if (a < 0.5f)
+            return (value > 0 ? 0.25f : -0.25f);
+        else if (a < 0.75f)
+            return (value > 0 ? 0.5f : -0.5f);
+        else if (a < 1.0f)
+            return (value > 0 ? 0.75f : -0.75f);
+
         return (value > 0 ? 1.0f : -1.0f);
     }
 
-    void joy_callback(const sensor_msgs::msg::Joy::SharedPtr joy_msg)
+    void send_excavation_request()
     {
-        if (joy_msg->axes.size() < 2) return;
-
-        // send CAN heartbeat
-        try {
-            leftMotor.Heartbeat();
-            rightMotor.Heartbeat();
-        } catch (const std::exception &ex) {
-            RCLCPP_ERROR(this->get_logger(), "Heartbeat error: %s", ex.what());
-        }
-
-        // safety triggers
-        bool triggersPressed = joy_msg->buttons.size() > 7 &&
-                               (joy_msg->buttons[Gp::Buttons::_LEFT_TRIGGER] > 0 ||
-                                joy_msg->buttons[Gp::Buttons::_RIGHT_TRIGGER] > 0);
-        if (!triggersPressed)
+        if (!excavation_client_->wait_for_service(std::chrono::milliseconds(500)))
         {
-            leftMotor.SetDutyCycle(0.0f);
-            rightMotor.SetDutyCycle(0.0f);
+            RCLCPP_WARN(this->get_logger(), "Excavation service not available.");
             return;
         }
 
-        float forward = -joy_msg->axes[Gp::Axes::_LEFT_VERTICAL_STICK];
-        float turn = joy_msg->axes[Gp::Axes::_LEFT_HORIZONTAL_STICK];
+        auto req = std::make_shared<controller_pkg::srv::ExcavationRequest::Request>();
+        req->start_excavation = true;
 
-        float left = std::clamp(forward + turn, -1.0f, 1.0f);
-        float right = std::clamp(forward - turn, -1.0f, 1.0f);
-
-        leftMotor.SetVelocity(computeStepOutput(left) * VELOCITY_MAX);
-        rightMotor.SetVelocity(computeStepOutput(right) * VELOCITY_MAX);
+        excavation_client_->async_send_request(req);
+        RCLCPP_INFO(this->get_logger(), "Sent excavation request.");
     }
 
-    void publish_heartbeat()
+    void joy_callback(const general_msgs::msg::Joy::SharedPtr msg)
     {
-        auto msg = std_msgs::msg::String();
-        msg.data = "Heartbeat";
-        heartbeatPub->publish(msg);
-        RCLCPP_INFO(this->get_logger(), "Heartbeat published");
+        float leftJS = -msg->axes[Gp::Axes::_LEFT_VERTICAL_STICK];
+        float rightJS = -msg->axes[Gp::Axes::_RIGHT_VERTICAL_STICK];
+
+        float leftOut = joystickToDutyCycle(leftJS);
+        float rightOut = joystickToDutyCycle(rightJS);
+
+        leftMotor.SetDutyCycle(leftOut);
+        rightMotor.SetDutyCycle(rightOut);
+
+        if (msg->buttons[Gp::Buttons::_A])
+        {
+            send_excavation_request();
+        }
     }
+
+    void heartbeat_timer()
+    {
+        try
+        {
+            leftMotor.Heartbeat();
+            rightMotor.Heartbeat();
+        }
+        catch (const std::exception &e)
+        {
+            RCLCPP_ERROR(this->get_logger(), "Heartbeat error: %s", e.what());
+        }
+    }
+
+    rclcpp::Subscription<general_msgs::msg::Joy>::SharedPtr joy_subscriber_;
+    rclcpp::Client<controller_pkg::srv::ExcavationRequest>::SharedPtr excavation_client_;
+    rclcpp::TimerBase::SharedPtr timer_;
+
+    SparkMax leftMotor;
+    SparkMax rightMotor;
 };
 
 int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
+
     std::string can_interface = "can0";
+    auto param_node = rclcpp::Node::make_shared("controller_param_node");
+
+    param_node->declare_parameter<std::string>("can_interface", "can0");
+    param_node->get_parameter("can_interface", can_interface);
+
     auto node = std::make_shared<ControllerNode>(can_interface);
+
     rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;
